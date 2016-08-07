@@ -42,7 +42,11 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <sstream>
 
+#include <boost/range/adaptor/map.hpp>
+
+#include <dirent.h>
 #include <errno.h>
 #include <limits.h>
 #include <signal.h>
@@ -185,7 +189,7 @@ pid_t wait_and_ignore_intr(const pid_t pid, int* status) {
   return retval;
 }
 
-bool attach_to_pid(craner_state& state, const pid_t pid) {
+bool seize(craner_state& state, const pid_t pid) {
   if (ptrace(PTRACE_SEIZE, pid, NULL, PTRACE_O_TRACESYSGOOD) < 0) {
     std::cerr << "Could not seize PID " << pid << ": " << strerror(errno) << std::endl;
     return false;
@@ -195,6 +199,33 @@ bool attach_to_pid(craner_state& state, const pid_t pid) {
     return false;
   }
   state.add_tracee(pid);
+  return true;
+}
+
+bool attach_to_pid(craner_state& state, const pid_t pid) {
+  if (!seize(state, pid)) {
+    return false;
+  }
+
+  // Attach to other threads as well
+  std::stringstream proc_dir;
+  proc_dir << "/proc/" << pid << "/task";
+  DIR* dir = opendir(proc_dir.str().c_str());
+  if (dir != NULL) {
+    dirent* de;
+    while ((de = readdir(dir)) != NULL) {
+      if (de->d_fileno == 0) {
+        continue;
+      }
+
+      pid_t thread_id = to_pid(de->d_name);
+      if (thread_id > 0 && thread_id != pid) {
+        seize(state, thread_id);
+      }
+    }
+  }
+  closedir(dir);
+
   return true;
 }
 
@@ -342,25 +373,27 @@ bool trace_step(craner_state& state) {
   return true;
 }
 
-void clean_up(craner_state& state, const pid_t pid) {
-  if (ptrace(PTRACE_INTERRUPT, pid, NULL, NULL) < 0) {
-    return;
-  }
-  int status;
-  if (waitpid(pid, &status, __WALL) < 0) {
-    if (errno != EINTR) {
-      std::cerr << "Error while detaching: waitpid returned " << strerror(errno) << std::endl;
+void clean_up(craner_state& state) {
+  for (auto&& tracee: state.tracees | boost::adaptors::map_values) {
+    if (ptrace(PTRACE_INTERRUPT, tracee.pid, NULL, NULL) < 0) {
       return;
     }
-  } else if (WIFSTOPPED(status)) {
-    int sig = WSTOPSIG(status);
-    const unsigned event = static_cast<unsigned>(status >> 16);
-    if (event == PTRACE_EVENT_STOP) {
-      sig = 0;
-    } else if (sig == SYSCALL_TRAP_SIG) {
-      sig = 0;
+    int status;
+    if (waitpid(tracee.pid, &status, __WALL) < 0) {
+      if (errno != EINTR) {
+        std::cerr << "Error while detaching: waitpid returned " << strerror(errno) << std::endl;
+        return;
+      }
+    } else if (WIFSTOPPED(status)) {
+      int sig = WSTOPSIG(status);
+      const unsigned event = static_cast<unsigned>(status >> 16);
+      if (event == PTRACE_EVENT_STOP) {
+        sig = 0;
+      } else if (sig == SYSCALL_TRAP_SIG) {
+        sig = 0;
+      }
+      ptrace(PTRACE_DETACH, tracee.pid, NULL, sig);
     }
-    ptrace(PTRACE_DETACH, pid, NULL, sig);
   }
 }
 
@@ -407,6 +440,6 @@ int main(int argc, char** argv) {
     ;
 
   std::cout << "Cleaning up" << std::endl;
-  clean_up(state, pid);
+  clean_up(state);
   return 0;
 }
