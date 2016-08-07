@@ -77,7 +77,7 @@
 # endif
 #endif
 #ifndef PTRACE_EVENT_STOP
-# define PTRACE_EVENT_STOP	128
+# define PTRACE_EVENT_STOP  128
 #endif
 
 volatile sig_atomic_t interrupted;
@@ -86,28 +86,28 @@ sigset_t blocked_set;
 const size_t max_syscall_args = 6;
 
 struct i386_user_regs_struct {
-	uint32_t ebx;
-	uint32_t ecx;
-	uint32_t edx;
-	uint32_t esi;
-	uint32_t edi;
-	uint32_t ebp;
-	uint32_t eax;
-	uint32_t xds;
-	uint32_t xes;
-	uint32_t xfs;
-	uint32_t xgs;
-	uint32_t orig_eax;
-	uint32_t eip;
-	uint32_t xcs;
-	uint32_t eflags;
-	uint32_t esp;
-	uint32_t xss;
+  uint32_t ebx;
+  uint32_t ecx;
+  uint32_t edx;
+  uint32_t esi;
+  uint32_t edi;
+  uint32_t ebp;
+  uint32_t eax;
+  uint32_t xds;
+  uint32_t xes;
+  uint32_t xfs;
+  uint32_t xgs;
+  uint32_t orig_eax;
+  uint32_t eip;
+  uint32_t xcs;
+  uint32_t eflags;
+  uint32_t esp;
+  uint32_t xss;
 };
 
 union x86_regs_union {
-	user_regs_struct      x86_64_r;
-	i386_user_regs_struct i386_r;
+  user_regs_struct      x86_64_r;
+  i386_user_regs_struct i386_r;
 };
 
 const unsigned int SYSCALL_TRAP_SIG = SIGTRAP | 0x80;
@@ -214,7 +214,7 @@ tracee_info* craner_state::add_tracee_if_required(const pid_t pid, const int sta
 }
 
 void interrupt(int sig) {
-	interrupted = sig;
+  interrupted = sig;
 }
 
 pid_t to_pid(const char* input) {
@@ -313,20 +313,20 @@ long get_syscall_number(iovec& io) {
 void get_syscall_args(tracee_info& tracee, iovec& io) {
   const x86_regs_union* const regs = static_cast<const x86_regs_union* const>(io.iov_base);
   if (io.iov_len != sizeof(i386_user_regs_struct)) {
-		tracee.syscall_arg[0] = regs->x86_64_r.rdi;
-		tracee.syscall_arg[1] = regs->x86_64_r.rsi;
-		tracee.syscall_arg[2] = regs->x86_64_r.rdx;
-		tracee.syscall_arg[3] = regs->x86_64_r.r10;
-		tracee.syscall_arg[4] = regs->x86_64_r.r8;
-		tracee.syscall_arg[5] = regs->x86_64_r.r9;
-	} else {
-		tracee.syscall_arg[0] = regs->i386_r.ebx;
-		tracee.syscall_arg[1] = regs->i386_r.ecx;
-		tracee.syscall_arg[2] = regs->i386_r.edx;
-		tracee.syscall_arg[3] = regs->i386_r.esi;
-		tracee.syscall_arg[4] = regs->i386_r.edi;
-		tracee.syscall_arg[5] = regs->i386_r.ebp;
-	}
+    tracee.syscall_arg[0] = regs->x86_64_r.rdi;
+    tracee.syscall_arg[1] = regs->x86_64_r.rsi;
+    tracee.syscall_arg[2] = regs->x86_64_r.rdx;
+    tracee.syscall_arg[3] = regs->x86_64_r.r10;
+    tracee.syscall_arg[4] = regs->x86_64_r.r8;
+    tracee.syscall_arg[5] = regs->x86_64_r.r9;
+  } else {
+    tracee.syscall_arg[0] = regs->i386_r.ebx;
+    tracee.syscall_arg[1] = regs->i386_r.ecx;
+    tracee.syscall_arg[2] = regs->i386_r.edx;
+    tracee.syscall_arg[3] = regs->i386_r.esi;
+    tracee.syscall_arg[4] = regs->i386_r.edi;
+    tracee.syscall_arg[5] = regs->i386_r.ebp;
+  }
 }
 
 long get_syscall_result(iovec& io) {
