@@ -43,11 +43,13 @@
 #include <map>
 #include <memory>
 #include <sstream>
+#include <vector>
 
 #include <boost/range/adaptor/map.hpp>
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdio.h>
@@ -109,6 +111,7 @@ union x86_regs_union {
 };
 
 const unsigned int SYSCALL_TRAP_SIG = SIGTRAP | 0x80;
+const size_t DEFAULT_BUFFER_SIZE = 128 * 1024;
 
 enum tracee_state {
   ATTACHED          = 0x01,
@@ -120,30 +123,76 @@ struct tracee_info {
   int state;
   long syscall_number;
   long syscall_arg[max_syscall_args];
+  std::vector<char> buffer;
+  std::map<int, int> log_files;
 
   tracee_info(pid_t);
+  ~tracee_info();
   /** Whether the tracee is entering a syscall. */
   bool entering() const;
+  int get_or_open_log(const int, const int);
+  void close_log(const int);
 };
 
-tracee_info::tracee_info(pid_t pid_) : pid(pid_), state(0), syscall_number(0) { }
+tracee_info::tracee_info(pid_t pid_)
+  : pid(pid_), state(0), syscall_number(0), buffer(DEFAULT_BUFFER_SIZE),
+    log_files() { }
+
+tracee_info::~tracee_info() {
+  for (auto&& fd : log_files | boost::adaptors::map_values) {
+    if (fd >= 0) {
+      close(fd);
+    }
+  }
+}
 
 bool tracee_info::entering() const {
   return (state & TRACEE_IN_SYSCALL) == 0;
+}
+
+int tracee_info::get_or_open_log(const int log_dir_fd, const int fd) {
+  auto log_fd_iter = log_files.find(fd);
+  if (log_fd_iter == log_files.end()) {
+    timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    const long time = static_cast<long>(t.tv_sec) * 1000 + t.tv_nsec / 100000;
+    std::stringstream log_path;
+    log_path << pid << '_' << fd << '_' << time;
+    const int log_fd = openat(log_dir_fd, log_path.str().c_str(),
+                              O_APPEND | O_CREAT | O_WRONLY);
+    if (log_fd >= 0) {
+      log_files.emplace(fd, log_fd);
+    } else {
+      std::cerr << "WARN: Could not open log file for FD " << fd << ": "
+                << strerror(errno) << std::endl;
+    }
+    return log_fd;
+  }
+  return log_fd_iter->second;
+}
+
+void tracee_info::close_log(const int fd) {
+  const auto log_fd_iter = log_files.find(fd);
+  if (log_fd_iter != log_files.end()) {
+    close(log_fd_iter->second);
+    log_files.erase(log_fd_iter);
+  }
 }
 
 struct craner_state {
   std::map<pid_t, tracee_info> tracees;
   x86_regs_union x86_regs;
   iovec x86_io;
+  const int log_dir_fd;
 
-  craner_state();
+  craner_state(const int);
   tracee_info* lookup_tracee(const pid_t);
   tracee_info* add_tracee(const pid_t);
   tracee_info* add_tracee_if_required(const pid_t, const int status);
 };
 
-craner_state::craner_state() : tracees(), x86_regs(), x86_io() {
+craner_state::craner_state(const int log_dir_fd_)
+  : tracees(), x86_regs(), x86_io(), log_dir_fd(log_dir_fd_) {
   x86_io.iov_base = &x86_regs;
 }
 
@@ -291,7 +340,11 @@ long get_syscall_result(iovec& io) {
 
 void handle_read_result(craner_state& state, tracee_info& tracee, long result) {
   if (result > 0) {
-    char* data = new char[result];
+    const int fd = tracee.syscall_arg[0];
+    if (tracee.buffer.capacity() < static_cast<size_t>(result)) {
+      tracee.buffer.reserve(result);
+    }
+    char* data = &*tracee.buffer.begin();
     const iovec local = {
       data, static_cast<size_t>(result)
     };
@@ -301,16 +354,19 @@ void handle_read_result(craner_state& state, tracee_info& tracee, long result) {
     };
     ssize_t bytes_read = process_vm_readv(tracee.pid, &local, 1, &remote, 1, 0);
     if (bytes_read < 0) {
-      delete data;
       std::cerr << "WARN: process_vm_readv returned " << strerror(errno)
-                << ", skipping some data for FD " << tracee.syscall_arg[0] << std::endl;
+                << ", skipping some data for FD " << fd << std::endl;
       return;
     }
-    std::cout << "Read " << bytes_read << " bytes from FD " << tracee.syscall_arg[0] << ": ";
-    std::cout.write(data, bytes_read);
-    std::cout << std::endl;
-    delete data;
+    const int log_fd = tracee.get_or_open_log(state.log_dir_fd, fd);
+    if (log_fd >= 0) {
+      write(log_fd, data, bytes_read);
+    }
   }
+}
+
+void handle_close(tracee_info& tracee) {
+  tracee.close_log(tracee.syscall_arg[0]);
 }
 
 bool trace_syscall(craner_state& state, tracee_info& tracee) {
@@ -322,6 +378,8 @@ bool trace_syscall(craner_state& state, tracee_info& tracee) {
   } else {
     if (tracee.syscall_number == SYS_read) {
       handle_read_result(state, tracee, get_syscall_result(state.x86_io));
+    } else if (tracee.syscall_number == SYS_close) {
+      handle_close(tracee);
     }
     tracee.state &= ~TRACEE_IN_SYSCALL;
     return restart_tracee(tracee.pid);
@@ -374,7 +432,7 @@ bool trace_step(craner_state& state) {
 }
 
 void clean_up(craner_state& state) {
-  for (auto&& tracee: state.tracees | boost::adaptors::map_values) {
+  for (auto&& tracee : state.tracees | boost::adaptors::map_values) {
     if (ptrace(PTRACE_INTERRUPT, tracee.pid, NULL, NULL) < 0) {
       return;
     }
@@ -416,21 +474,27 @@ void setup_signals() {
 }
 
 int main(int argc, char** argv) {
-  if (argc != 2) {
-    std::cerr << "Usage: craner <PID>" << std::endl;
+  if (argc != 3) {
+    std::cerr << "Usage: craner <log directory> <PID>" << std::endl;
     return 1;
   }
 
-  const pid_t pid = to_pid(argv[1]);
+  const pid_t pid = to_pid(argv[2]);
   if (pid == 0) {
-    std::cerr << "Invalid PID: " << argv[1] << std::endl;
+    std::cerr << "Invalid PID: " << argv[2] << std::endl;
     return 1;
   }
 
   setup_signals();
 
-  craner_state state;
+  const int log_dir_fd = open(argv[1], O_DIRECTORY);
+  if (log_dir_fd < 0) {
+    std::cerr << "Invalid log directory: " << strerror(errno) << std::endl;
+    return 1;
+  }
+  craner_state state(log_dir_fd);
   if (!attach_to_pid(state, pid)) {
+    close(log_dir_fd);
     return 1;
   }
   std::cout << "Attached to " << pid << std::endl;
@@ -441,5 +505,6 @@ int main(int argc, char** argv) {
 
   std::cout << "Cleaning up" << std::endl;
   clean_up(state);
+  close(log_dir_fd);
   return 0;
 }
