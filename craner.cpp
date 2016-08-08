@@ -1,5 +1,9 @@
 /**
- * Dump a docker container's incoming network traffic.
+ * docker-proxy inspector: Dump a docker container's incoming network traffic
+ * and find out which file descriptor pairs belong to one connection (frontend
+ * FD and backend FD).
+ *
+ * Most useful in combination with ss, the socket statistics tool.
  *
  * Written 2016 by Andreas Stührk.
  */
@@ -125,6 +129,7 @@ struct tracee_info {
   long syscall_arg[max_syscall_args];
   std::vector<char> buffer;
   std::map<int, int> log_files;
+  std::map<long, std::pair<int, int>> conn_pairs;
 
   tracee_info(pid_t);
   ~tracee_info();
@@ -132,6 +137,7 @@ struct tracee_info {
   bool entering() const;
   int get_or_open_log(const int, const int);
   void close_log(const int);
+  std::pair<int, int>& get_conn_pair(const long);
 };
 
 tracee_info::tracee_info(pid_t pid_)
@@ -177,6 +183,10 @@ void tracee_info::close_log(const int fd) {
     close(log_fd_iter->second);
     log_files.erase(log_fd_iter);
   }
+}
+
+std::pair<int, int>& tracee_info::get_conn_pair(const long buffer_addr) {
+  return conn_pairs.emplace(buffer_addr, std::make_pair(-1, -1)).first->second;
 }
 
 struct craner_state {
@@ -341,32 +351,44 @@ long get_syscall_result(iovec& io) {
 void handle_read_result(craner_state& state, tracee_info& tracee, long result) {
   if (result > 0) {
     const int fd = tracee.syscall_arg[0];
-    if (tracee.buffer.capacity() < static_cast<size_t>(result)) {
-      tracee.buffer.reserve(result);
-    }
-    char* data = &*tracee.buffer.begin();
-    const iovec local = {
-      data, static_cast<size_t>(result)
-    };
-    const iovec remote = {
-      reinterpret_cast<void *>(tracee.syscall_arg[1]),
-      static_cast<size_t>(result)
-    };
-    ssize_t bytes_read = process_vm_readv(tracee.pid, &local, 1, &remote, 1, 0);
-    if (bytes_read < 0) {
-      std::cerr << "WARN: process_vm_readv returned " << strerror(errno)
-                << ", skipping some data for FD " << fd << std::endl;
-      return;
-    }
-    const int log_fd = tracee.get_or_open_log(state.log_dir_fd, fd);
-    if (log_fd >= 0) {
-      write(log_fd, data, bytes_read);
+    tracee.get_conn_pair(tracee.syscall_arg[1]).first = fd;
+    if (state.log_dir_fd >= 0) {
+      if (tracee.buffer.capacity() < static_cast<size_t>(result)) {
+        tracee.buffer.reserve(result);
+      }
+      char* data = &*tracee.buffer.begin();
+      const iovec local = {
+        data, static_cast<size_t>(result)
+      };
+      const iovec remote = {
+        reinterpret_cast<void *>(tracee.syscall_arg[1]),
+        static_cast<size_t>(result)
+      };
+      ssize_t bytes_read = process_vm_readv(tracee.pid, &local, 1, &remote, 1, 0);
+      if (bytes_read < 0) {
+        std::cerr << "WARN: process_vm_readv returned " << strerror(errno)
+                  << ", skipping some data for FD " << fd << std::endl;
+        return;
+      }
+      const int log_fd = tracee.get_or_open_log(state.log_dir_fd, fd);
+      if (log_fd >= 0) {
+        write(log_fd, data, bytes_read);
+      }
     }
   }
 }
 
 void handle_close(tracee_info& tracee) {
   tracee.close_log(tracee.syscall_arg[0]);
+}
+
+void handle_write(tracee_info& tracee) {
+  const int fd = tracee.syscall_arg[0];
+  auto& conn_pair = tracee.get_conn_pair(tracee.syscall_arg[1]);
+  if (conn_pair.second != fd) {
+    conn_pair.second = fd;
+    std::cout << "Found connection pair: " << conn_pair.first << " -> " << fd << std::endl;
+  }
 }
 
 bool trace_syscall(craner_state& state, tracee_info& tracee) {
@@ -380,6 +402,8 @@ bool trace_syscall(craner_state& state, tracee_info& tracee) {
       handle_read_result(state, tracee, get_syscall_result(state.x86_io));
     } else if (tracee.syscall_number == SYS_close) {
       handle_close(tracee);
+    } else if (tracee.syscall_number == SYS_write) {
+      handle_write(tracee);
     }
     tracee.state &= ~TRACEE_IN_SYSCALL;
     return restart_tracee(tracee.pid);
@@ -474,12 +498,19 @@ void setup_signals() {
 }
 
 int main(int argc, char** argv) {
-  if (argc != 3) {
+  char* log_dir = NULL;
+  char* pid_input;
+  if (argc == 2) {
+    pid_input = argv[1];
+  } else if (argc == 3) {
+    log_dir = argv[1];
+    pid_input = argv[2];
+  } else {
     std::cerr << "Usage: craner <log directory> <PID>" << std::endl;
     return 1;
   }
 
-  const pid_t pid = to_pid(argv[2]);
+  const pid_t pid = to_pid(pid_input);
   if (pid == 0) {
     std::cerr << "Invalid PID: " << argv[2] << std::endl;
     return 1;
@@ -487,14 +518,19 @@ int main(int argc, char** argv) {
 
   setup_signals();
 
-  const int log_dir_fd = open(argv[1], O_DIRECTORY);
-  if (log_dir_fd < 0) {
-    std::cerr << "Invalid log directory: " << strerror(errno) << std::endl;
-    return 1;
+  int log_dir_fd = -1;
+  if (log_dir) {
+    log_dir_fd = open(argv[1], O_DIRECTORY);
+    if (log_dir_fd < 0) {
+      std::cerr << "Invalid log directory: " << strerror(errno) << std::endl;
+      return 1;
+    }
   }
   craner_state state(log_dir_fd);
   if (!attach_to_pid(state, pid)) {
-    close(log_dir_fd);
+    if (log_dir_fd >= 0) {
+      close(log_dir_fd);
+    }
     return 1;
   }
   std::cout << "Attached to " << pid << std::endl;
@@ -505,6 +541,8 @@ int main(int argc, char** argv) {
 
   std::cout << "Cleaning up" << std::endl;
   clean_up(state);
-  close(log_dir_fd);
+  if (log_dir_fd >= 0) {
+    close(log_dir_fd);
+  }
   return 0;
 }
